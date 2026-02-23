@@ -1,0 +1,315 @@
+# mais
+
+
+locals {
+  
+  # Required APIs for Eventarc Standard triggers to Cloud Run / Workflows / PubSub transport
+  required_apis = toset(distinct(concat([
+    "eventarc.googleapis.com",
+    "run.googleapis.com",
+    "pubsub.googleapis.com",
+  ], var.extra_apis)))
+
+  triggers_effective = {
+    for k, v in var.triggers : k => merge(v, {
+      location = coalesce(try(v.location, null), var.default_location)
+      labels   = coalesce(try(v.labels, null), {})
+    })
+  }
+}
+
+resource "google_project_service" "apis" {
+  for_each           = var.enable_apis ? local.required_apis : toset([])
+  project            = var.project_id
+  service            = each.value
+  disable_on_destroy = false
+}
+
+resource "google_eventarc_trigger" "standard" {
+  provider = google-beta
+  for_each = local.triggers_effective
+
+  project  = var.project_id
+  name     = each.value.name
+  location = each.value.location
+
+  service_account = each.value.service_account
+
+  dynamic "matching_criteria" {
+    for_each = each.value.matching_criteria
+    content {
+      attribute = matching_criteria.value.attribute
+      value     = matching_criteria.value.value
+    }
+  }
+
+  destination {
+    dynamic "cloud_run_service" {
+      for_each = each.value.destination.type == "cloud_run" ? [each.value.destination] : []
+      content {
+        service = cloud_run_service.value.cloud_run_service
+        region  = cloud_run_service.value.cloud_run_region
+        path    = try(cloud_run_service.value.path, null)
+      }
+    }
+
+    # dynamic "workflow" {
+    #   for_each = each.value.destination.type == "workflows" ? [each.value.destination] : []
+    #   content {
+    #     workflow = workflow.value.workflow_id
+    #   }
+    # }
+
+    dynamic "http_endpoint" {
+      for_each = each.value.destination.type == "http" ? [each.value.destination] : []
+      content {
+        uri = http_endpoint.value.uri
+      }
+    }
+  }
+
+  dynamic "transport" {
+    for_each = try(each.value.transport_pubsub_topic, null) != null ? [each.value.transport_pubsub_topic] : []
+    content {
+      pubsub {
+        topic = transport.value
+      }
+    }
+  }
+
+  labels = each.value.labels
+
+  depends_on = [google_project_service.apis]
+}
+
+##################################################################################
+#outputs
+
+output "trigger_ids" {
+  description = "Map of trigger keys to full trigger resource IDs."
+  value       = { for k, v in google_eventarc_trigger.standard : k => v.id }
+}
+
+output "trigger_names" {
+  description = "Map of trigger keys to trigger names."
+  value       = { for k, v in google_eventarc_trigger.standard : k => v.name }
+}
+
+output "triggers" {
+  description = "Map of trigger keys to useful trigger attributes."
+  value = {
+    for k, v in google_eventarc_trigger.standard : k => {
+      id       = v.id
+      name     = v.name
+      location = v.location
+      project  = v.project
+    }
+  }
+}
+
+########################################################################################################
+# variables.tf 
+
+variable "region" {
+  type    = string
+  default = "us-east1"
+}
+
+# variable "bucket_name" {
+#   type = string
+# }
+
+variable "default_location" {
+  description = "Default region/location for triggers if not set per-trigger"
+  type        = string
+  default     = null
+}
+
+variable "enable_apis" {
+  description = "Whether to enable required APIs (eventarc, run, pubsub). Set false if managed elsewhere."
+  type        = bool
+  default     = true
+}
+
+variable "extra_apis" {
+  description = "Extra APIs to enable if enable_apis=true."
+  type        = list(string)
+  default     = []
+}
+
+variable "triggers" {
+  description = <<EOT
+Map of Eventarc Standard triggers. Each trigger supports:
+- matching_criteria (list of attribute/value)
+- destination: one of cloud_run | workflows | http
+- optional transport_pubsub_topic
+EOT
+
+  type = map(object({
+    name            = string
+    location        = optional(string) # override per-trigger; else default_location
+    service_account = string
+
+    matching_criteria = list(object({
+      attribute = string
+      value     = string
+    }))
+
+    destination = object({
+      type = string # "cloud_run" | "workflows" | "http"
+
+      # cloud_run
+      cloud_run_service = optional(string)
+      cloud_run_region  = optional(string)
+      path              = optional(string)
+
+      # workflows
+      workflow_id = optional(string)
+
+      # http
+      uri = optional(string)
+    })
+
+    # Optional Pub/Sub transport topic (full resource name or topic ID depending on your usage)
+    transport_pubsub_topic = optional(string)
+
+    labels = optional(map(string))
+  }))
+
+  validation {
+    condition = alltrue([
+      for k, t in var.triggers :
+      contains(["cloud_run", "workflows", "http"], t.destination.type)
+    ])
+    error_message = "Each trigger.destination.type must be one of: cloud_run, workflows, http."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, t in var.triggers :
+      length(t.matching_criteria) > 0
+    ])
+    error_message = "Each trigger must include at least one matching_criteria entry."
+  }
+
+  # Destination field validations
+  validation {
+    condition = alltrue([
+      for k, t in var.triggers :
+      t.destination.type != "cloud_run" || (
+        try(t.destination.cloud_run_service, null) != null &&
+        try(t.destination.cloud_run_region, null)  != null
+      )
+    ])
+    error_message = "For destination.type=cloud_run you must set destination.cloud_run_service and destination.cloud_run_region."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, t in var.triggers :
+      t.destination.type != "workflows" || (
+        try(t.destination.workflow_id, null) != null
+      )
+    ])
+    error_message = "For destination.type=workflows you must set destination.workflow_id."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, t in var.triggers :
+      t.destination.type != "http" || (
+        try(t.destination.uri, null) != null
+      )
+    ])
+    error_message = "For destination.type=http you must set destination.uri."
+  }
+}
+#################################################################################################
+# versions.tf
+
+terraform {
+  required_version = ">= 1.3.0"
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = ">= 5.0"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = ">= 5.0"
+  }
+ }
+} 
+
+###############################################################################
+
+provider "google" {
+  project = "my-project-id"
+  region  = "us-central1"
+}
+
+provider "google-beta" {
+  project = "my-project-id"
+  region  = "us-central1"
+}
+
+module "eventarc_triggers" {
+  source = "./modules/gcp-eventarc-standard"
+
+  project_id       = "gcplearn01-445318"
+  default_location = "us-east1"
+  enable_apis      = true
+  extra_apis       = ["logging.googleapis.com"]
+
+  triggers = {
+    # Example 1: Cloud Run Destination
+    "run-trigger" = {
+      name            = "pubsub-to-run-trigger"
+      location        = "us-east1"
+      service_account = "eventarc-sa@my-project-id.iam.gserviceaccount.com"
+      matching_criteria = [
+        {
+          attribute = "type"
+          value     = "google.cloud.pubsub.topic.v1.messagePublished"
+        }
+      ]
+      destination = {
+        type               = "cloud_run"
+        cloud_run_service  = "my-receiving-service"
+        cloud_run_region   = "us-east1"
+        path               = "/events"
+      }
+      transport_pubsub_topic = "projects/my-project-id/topics/my-topic"
+      labels = {
+        env = "dev"
+      }
+    }
+  }
+}
+#  ,
+
+    # Example 2: Workflows Destination
+#     "workflow-trigger" = {
+#       name            = "storage-to-workflow-trigger"
+#       location        = "us-central1"
+#       service_account = "eventarc-sa@my-project-id.iam.gserviceaccount.com"
+#       matching_criteria = [
+#         {
+#           attribute = "type"
+#           value     = "google.cloud.storage.object.v1.finalized"
+#         },
+#         {
+#           attribute = "bucket"
+#           value     = "my-data-bucket"
+#         }
+#       ]
+#       destination = {
+#         type        = "workflows"
+#         workflow_id = "projects/my-project-id/locations/us-central1/workflows/my-workflow"
+#       }
+#     }
+#   }
+#}
+
+
